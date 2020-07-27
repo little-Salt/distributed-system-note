@@ -24,6 +24,25 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type WorkerConfigRequestArgs struct {
+	WorkerID int
+}
+
+type WorkerConfigRequestReply struct {
+	NumOfPartition int
+}
+
+type TaskRequestArgs struct {
+	WorkerID				int
+	LastCompletedTask 		*Task
+	CompletedTaskResults	[]string
+}
+
+type TaskRequestReply struct {
+	JobState MrState
+	WaitFlag bool
+	NextTask *Task
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

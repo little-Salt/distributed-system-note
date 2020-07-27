@@ -1,0 +1,8 @@
+
+# mr out folder
+/mr-tmp
+
+# mr build
+mrmaster
+mrsequential
+mrworker
