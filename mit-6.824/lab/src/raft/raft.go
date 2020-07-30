@@ -17,14 +17,27 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
 
+const (
+	follower = iota
+	candidate
+	leader
+)
 
+// election timeout
+const electionTimeout int = 300
+const heartbeatsFreq int = 150
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +56,10 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Term int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,17 +73,36 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state            int
+	voteGrantedCount int
 
+	// Persistent state on all servers
+	currentTerm int
+	votedFor    int // -1 means null
+	log         []LogEntry
+
+	// Volatile state on all servers:
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders:
+	nextIndex  []int
+	matchIndex []int
+
+	// channel for signal
+	applyCh       chan ApplyMsg
+	heartbeatCh   chan bool
+	grantVoteCh   chan bool
+	electionWinCh chan bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, (rf.state == leader)
 }
 
 //
@@ -84,7 +120,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,15 +143,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -124,7 +160,16 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+func (rf *Raft) convertToFollower(term int) {
+	DPrintf("Server %d: set server as follower in term %d", rf.me, term)
+	rf.currentTerm = term
+	rf.state = follower
+	rf.votedFor = -1
+	rf.voteGrantedCount = 0
 }
 
 //
@@ -132,6 +177,97 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+
+	DPrintf("Server %d: recieved vote request with arg: %+v", rf.me, *args)
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		DPrintf("Server %d: rely vote request with: %+v", rf.me, *reply)
+		rf.mu.Unlock()
+		return 
+	} else if args.Term > rf.currentTerm {
+		rf.convertToFollower(args.Term)
+		reply.Term = rf.currentTerm
+	}
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
+		// candidate’s log is at least as up-to-date as receiver’s log
+		if isCandidateUptoDate(args.LastLogIndex, args.LastLogTerm, rf) {
+			rf.votedFor = args.CandidateID
+			reply.VoteGranted = true
+			DPrintf("Server %d: send heartbeat signal", rf.me)
+			DPrintf("Server %d: rely vote request with: %+v", rf.me, *reply)
+			rf.mu.Unlock()
+			rf.grantVoteCh <- true
+			return
+		}
+	}
+	DPrintf("Server %d: rely vote request with: %+v", rf.me, *reply)
+	rf.mu.Unlock()
+	return
+	
+}
+
+func (rf *Raft) getLastLogInfo() (int, int) {
+	lastLogIndex := len(rf.log) - 1
+	return lastLogIndex, rf.log[lastLogIndex].Term
+}
+
+// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
+// If the logs end with the same term, then whichever log is longer is more up-to-date.
+func isCandidateUptoDate(cLastLogIndex int, cLastLogTerm int, rf *Raft) bool {
+	lastLogIndex, lastLogTerm := rf.getLastLogInfo()
+	return (cLastLogTerm > lastLogTerm) || (cLastLogTerm == lastLogTerm && cLastLogIndex >= lastLogIndex)
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+
+	DPrintf("Server %d: recieved append request with arg: %+v", rf.me, *args)
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		DPrintf("Server %d: old term ignore request. with reply %+v", rf.me, *reply)
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.convertToFollower(args.Term)
+		reply.Term = rf.currentTerm
+	}
+
+	rf.mu.Unlock()
+	DPrintf("Server %d: send heartbeat signal", rf.me)
+	rf.heartbeatCh <- true
+	if len(args.Entries) == 0 {
+		// heartbeats request
+		reply.Success = true
+		DPrintf("Server %d: reply heartbeats request with: %+v", rf.me, *reply)
+		return
+	}
+
+	// for now should not reach here
+	DPrintf("Server %d: reply append request with: %+v", rf.me, *reply)
 }
 
 //
@@ -164,10 +300,86 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf("Server %d: send vote request to server %d with args %+v.", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
+func (rf *Raft) getVoteFromPeer(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	ok := rf.sendRequestVote(server, args, reply)
+	
+	if ok {
+		rf.mu.Lock()
+		
+		DPrintf("Server %d: recieved vote reply from server %d with reply %+v", rf.me, server, *reply)
+
+		if reply.Term < rf.currentTerm {
+			// invalid reply: reply to old or have enough vote
+			DPrintf("Server %d: reply invalid", rf.me)
+			rf.mu.Unlock()
+			return
+		} else if reply.Term > rf.currentTerm {
+			// discover higher term
+			rf.convertToFollower(reply.Term)
+			rf.mu.Unlock()
+			return
+		} else {
+			if rf.state == candidate && reply.VoteGranted {
+				rf.voteGrantedCount++
+				if rf.voteGrantedCount > (len(rf.peers) / 2) {
+					rf.state = leader
+					DPrintf("Server %d: wins election in term %d.", rf.me, rf.currentTerm)
+					rf.mu.Unlock()
+					rf.electionWinCh <- true
+					return
+				}
+			}
+			rf.mu.Unlock()
+			return
+		}
+	} else {
+		DPrintf("Server %d: no vote reply from server %d.", rf.me, server)
+	}
+
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("Server %d: send AppendEntries request to server %d with args %+v.", rf.me, server, *args)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	return ok
+}
+
+func (rf *Raft) ackAppendEntrie(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.sendAppendEntries(server, args, reply)
+
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		DPrintf("Server %d: recieved AppendEntries reply from server %d with reply %+v", rf.me, server, *reply)
+
+		if reply.Term < rf.currentTerm {
+			// invalid reply: reply to old or have enough vote
+			DPrintf("Server %d: reply invalid", rf.me)
+			return
+		} else if reply.Term > rf.currentTerm {
+			// discover higher term
+			rf.convertToFollower(reply.Term)
+			return
+		} else {
+			if rf.state != leader {
+				// should not be here
+				DPrintf("Server %d: not leader in term %d", rf.me, rf.currentTerm)
+				return
+			}
+			return
+		}
+
+	} else {
+		DPrintf("Server %d: no AppendEntries reply from server %d.", rf.me, server)
+	}
+
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +401,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -215,6 +426,106 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != candidate {
+		return
+	}
+	rf.currentTerm++
+	rf.voteGrantedCount = 1
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIndex, lastLogTerm}
+	DPrintf("Server %d: start election.", rf.me)
+
+	for server, _ := range rf.peers {
+		if server != rf.me {
+			reply := RequestVoteReply{}
+			go rf.getVoteFromPeer(server, &args, &reply)
+		}
+	}
+}
+
+func (rf *Raft) broadcastHeartbeats() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != leader {
+		return
+	}
+	DPrintf("Server %d: broadcast Heartbeats.", rf.me)
+	for server, _ := range rf.peers {
+		if server != rf.me {
+			// default heartbeat
+			args := AppendEntriesArgs{rf.currentTerm, rf.me, 0, 0, []LogEntry{}, 0}
+			reply := AppendEntriesReply{}
+			go rf.ackAppendEntrie(server, &args, &reply)
+		}
+	}
+
+}
+
+func (rf *Raft) run() {
+	for !rf.killed() {
+		DPrintf("Server %d: new run.", rf.me)
+		rf.mu.Lock()
+		switch rf.state {
+		case follower:
+			DPrintf("Server %d: run as follower.", rf.me)
+			rf.mu.Unlock()
+			// • If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
+			select {
+			case <-rf.grantVoteCh:
+			case <-rf.heartbeatCh:
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(electionTimeout)+electionTimeout)):
+				// promote to candidate and start election
+				rf.mu.Lock()
+				DPrintf("Server %d: promote to candidate.", rf.me)
+				rf.state = candidate
+				rf.mu.Unlock()
+			}
+
+		case candidate:
+			DPrintf("Server %d: run as candidate.", rf.me)
+			rf.mu.Unlock()
+			// On conversion to candidate, start election:
+			// 		• Increment currentTerm
+			// 		• Vote for self
+			// 		• Reset election timer
+			// 		• Send RequestVote RPCs to all other servers
+			// • If votes received from majority of servers: become leader
+			// • If AppendEntries RPC received from new leader: convert to follower
+			// • If election timeout elapses: start new election
+			go rf.startElection()
+			select {
+			case <-rf.electionWinCh:
+				// become to leader
+				rf.mu.Lock()
+				DPrintf("Server %d: become to leader.", rf.me)
+				rf.state = leader
+				rf.mu.Unlock()
+			case <-rf.heartbeatCh:
+				// received new leader, covert to follower
+				rf.mu.Lock()
+				DPrintf("Server %d: become to follower.", rf.me)
+				rf.state = follower
+				rf.mu.Unlock()
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(electionTimeout)+electionTimeout)):
+				// timeout start new election
+			}
+
+		case leader:
+			DPrintf("Server %d: run as leader.", rf.me)
+			rf.mu.Unlock()
+			// Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts
+			go rf.broadcastHeartbeats()
+			time.Sleep(time.Millisecond * time.Duration(heartbeatsFreq))
+		}
+
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -232,12 +543,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	DPrintf("Server %d: initial new server", me)
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = follower
+	rf.voteGrantedCount = 0
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = append(rf.log, LogEntry{Term: 0})
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.applyCh = applyCh
+	rf.heartbeatCh = make(chan bool)
+	rf.grantVoteCh = make(chan bool)
+	rf.electionWinCh = make(chan bool)
+
+	// rf.nextIndex
+	// rf.matchIndex
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	DPrintf("Server %d: initial finished with state: currentTerm: %d.", me, rf.currentTerm)
+	go rf.run()
 
 	return rf
 }

@@ -27,3 +27,8 @@ Two main RPC handlers for the worker are `WorkerConfig` and `NextTask`.
 
 #### Worker
 Each worker initializes with configuration send by the master. After initialization, it periodically sends the request to the master for the next task, if the request fails and excess max request retries then assume master dies, terminate itself. After the worker gets the next task it calls the corresponding task handler. If any error happens in the middle of the processing the task would cause the task to fail, the worker does not generate the partial results and send back to the master. The worker may receive a request from the master to wait for other workers or to terminate since the job has completed. 
+
+
+## Lab2 Raft
+
+- [x] Part A: Implement Raft leader election and heartbeats
