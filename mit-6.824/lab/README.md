@@ -33,3 +33,4 @@ Each worker initializes with configuration send by the master. After initializat
 
 - [x] Part A: Implement Raft leader election and heartbeats
 - [X] Part B: Implement the leader and follower code to append new log entries
+- [X] Part C: Raft persistent state
