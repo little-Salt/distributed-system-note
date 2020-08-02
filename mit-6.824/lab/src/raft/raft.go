@@ -115,7 +115,7 @@ func (rf *Raft) applyLogs() {
 	defer rf.mu.Unlock()
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		DPrintf("Server %d ----- Term %d : server apply log with index: %d, command: %v", rf.me, rf.currentTerm, i, rf.logs[i].Command)
+		DPrintf("Server %d ----- Term %d: server apply log with index: %d, command: %v", rf.me, rf.currentTerm, i, rf.logs[i].Command)
 		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i, Command: rf.logs[i].Command}
 	}
 	rf.lastApplied = rf.commitIndex
@@ -154,7 +154,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
 		DPrintf("Server %d ----- Term %d: server restore from persist fail", rf.me, rf.currentTerm)
 	} else {
-		DPrintf("Server %d ----- Term %d:: server restore from persist ", rf.me, rf.currentTerm)
+		DPrintf("Server %d ----- Term %d: server restore from persist ", rf.me, rf.currentTerm)
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
@@ -202,22 +202,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 	}
 
+	// need send grant vote signal even not vote to request candidate to reset election timeout
+	// otherwise some case the server would not have chance to promote to candidate
+	rf.nonBlockChSend(rf.grantVoteCh, true)
+
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && isCandidateUptoDate(args.LastLogIndex, args.LastLogTerm, rf) {
 		// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 		rf.votedFor = args.CandidateID
 		rf.persist()
 		reply.VoteGranted = true
-
-		rf.mu.Unlock()
-		rf.grantVoteCh <- true
-		rf.mu.Lock()
 	}
 	DPrintf("Server %d ----- Term %d: reply vote request with: %+v", rf.me, rf.currentTerm, *reply)
 }
 
+// send signal to channel without block, so that extra signal would not casuse dead lock
+func (rf *Raft) nonBlockChSend(ch chan bool, val bool) {
+	select {
+	case ch <- val:
+		DPrintf("Server %d ----- Term %d: signal send", rf.me, rf.currentTerm)
+	default:
+		DPrintf("Server %d ----- Term %d: signal not send", rf.me, rf.currentTerm)
+	}
+}
+
 func (rf *Raft) getLastLogInfo() (int, int) {
 	lastLogIndex := rf.logsCount - 1
-	return lastLogIndex, rf.logs[lastLogIndex].Term
+	lastLogTerm := rf.logs[lastLogIndex].Term
+	return lastLogIndex, lastLogTerm
 }
 
 // If the logs have last entries with different terms, then the log with the later term is more up-to-date.
@@ -257,12 +268,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term >= rf.currentTerm {
-		if rf.state != follower {
-			rf.setToFollower(args.Term)
-		}
+	if args.Term > rf.currentTerm {
+		rf.setToFollower(args.Term)
 		reply.Term = rf.currentTerm
 	}
+
+	rf.nonBlockChSend(rf.heartbeatCh, true)
 
 	// consistency check
 	if args.PrevLogIndex >= 0 && args.PrevLogIndex < rf.logsCount && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm {
@@ -285,11 +296,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.NextTryIndex = rf.findNextRetryIndex(args.PrevLogIndex, args.PrevLogTerm)
 	}
-
-	// recieve valid append request, send heartbeat signal
-	rf.mu.Unlock()
-	rf.heartbeatCh <- true
-	rf.mu.Lock()
 
 	DPrintf("Server %d ----- Term %d: reply append request with: %+v", rf.me, rf.currentTerm, *reply)
 }
@@ -351,7 +357,7 @@ func (rf *Raft) getVoteFromPeer(server int, args *RequestVoteArgs, reply *Reques
 	defer rf.mu.Unlock()
 
 	if !ok {
-		DPrintf("Server %d ----- Term %d: no vote reply from server %d for term %d.", rf.me, rf.currentTerm, server, args.Term)
+		// DPrintf("Server %d ----- Term %d: no vote reply from server %d for term %d.", rf.me, rf.currentTerm, server, args.Term)
 		return
 	}
 
@@ -368,10 +374,12 @@ func (rf *Raft) getVoteFromPeer(server int, args *RequestVoteArgs, reply *Reques
 		if rf.state == candidate && reply.VoteGranted {
 			rf.voteGrantedCount++
 			if rf.voteGrantedCount > (rf.clusterSize / 2) {
-				rf.setToLeader()
-				rf.mu.Unlock()
-				rf.electionWinCh <- true
-				rf.mu.Lock()
+				// rf.setToLeader()
+				// rf.electionWinCh <- true
+				rf.nonBlockChSend(rf.electionWinCh, true)
+				// rf.mu.Unlock()
+				// rf.electionWinCh <- true
+				// rf.mu.Lock()
 				DPrintf("Server %d ----- Term %d: wins election in term %d.", rf.me, rf.currentTerm, args.Term)
 				return
 			}
@@ -394,7 +402,7 @@ func (rf *Raft) ackAppendEntrie(server int, args *AppendEntriesArgs, reply *Appe
 	defer rf.mu.Unlock()
 
 	if !ok {
-		DPrintf("Server %d ----- Term %d: no append reply from server %d for term %d.", rf.me, rf.currentTerm, server, args.Term)
+		// DPrintf("Server %d ----- Term %d: no append reply from server %d for term %d.", rf.me, rf.currentTerm, server, args.Term)
 		return
 	}
 
@@ -510,8 +518,7 @@ func (rf *Raft) startElection() {
 		return
 	}
 
-	lastLogIndex := rf.logsCount - 1
-	lastLogTerm := rf.logs[lastLogIndex].Term
+	lastLogIndex, lastLogTerm := rf.getLastLogInfo()
 	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIndex, lastLogTerm}
 	DPrintf("Server %d ----- Term %d: start election.", rf.me, rf.currentTerm)
 
@@ -561,12 +568,13 @@ func (rf *Raft) setToFollower(term int) {
 }
 
 func (rf *Raft) setToCandidate() {
-	DPrintf("Server %d ----- Term %d: set as candidate", rf.me, rf.currentTerm)
+	DPrintf("Server %d ----- Term %d: set as candidate, and increase term by 1", rf.me, rf.currentTerm)
 	rf.state = candidate
 	rf.votedFor = rf.me
 	rf.currentTerm++
 	rf.persist()
 	rf.voteGrantedCount = 1
+	go rf.startElection()
 }
 
 func (rf *Raft) setToLeader() {
@@ -579,35 +587,37 @@ func (rf *Raft) setToLeader() {
 		rf.nextIndex[i] = initialNextIndex
 	}
 	rf.matchIndex = make([]int, rf.clusterSize)
-	rf.persist()
+	go rf.broadcastAppendRequests()
 }
 
 func (rf *Raft) run() {
 	for !rf.killed() {
-		DPrintf("Server %d: run.", rf.me)
 		rf.mu.Lock()
-		state := rf.state
 		term := rf.currentTerm
-		rf.mu.Unlock()
-		switch state {
+		DPrintf("Server %d ----- Term %d: run.", rf.me, term)
+		switch rf.state {
 		case follower:
 			DPrintf("Server %d ----- Term %d: run as follower.", rf.me, term)
+			rf.mu.Unlock()
 			// • If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
 			select {
 			case <-rf.grantVoteCh:
 			case <-rf.heartbeatCh:
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(electionTimeout)+electionTimeout)):
+				DPrintf("Server %d ----- Term %d: timeout in run.", rf.me, term)
 				// promote to candidate and start election
 				rf.mu.Lock()
-				DPrintf("Server %d ----- Term %d: promote to candidate.", rf.me, rf.currentTerm)
-				rf.state = candidate
+				if rf.currentTerm == term {
+					DPrintf("Server %d ----- Term %d: promote to candidate.", rf.me, rf.currentTerm)
+					rf.state = candidate
+				}
 				rf.mu.Unlock()
 			}
 
 		case candidate:
-			rf.mu.Lock()
 			rf.setToCandidate()
 			DPrintf("Server %d ----- Term %d: run as candidate.", rf.me, rf.currentTerm)
+			term = rf.currentTerm
 			rf.mu.Unlock()
 			// On conversion to candidate, start election:
 			// 		• Increment currentTerm
@@ -617,15 +627,32 @@ func (rf *Raft) run() {
 			// • If votes received from majority of servers: become leader
 			// • If AppendEntries RPC received from new leader: convert to follower
 			// • If election timeout elapses: start new election
-			go rf.startElection()
 			select {
 			case <-rf.electionWinCh:
+				rf.mu.Lock()
+				if rf.currentTerm == term {
+					DPrintf("Server %d ----- Term %d: win election, set to leader.", rf.me, rf.currentTerm)
+					rf.setToLeader()
+				}
+				rf.mu.Unlock()
 			case <-rf.heartbeatCh:
+				rf.mu.Lock()
+				DPrintf("Server %d ----- Term %d: back to follower.", rf.me, rf.currentTerm)
+				rf.state = follower
+				rf.mu.Unlock()
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(electionTimeout)+electionTimeout)):
+				DPrintf("Server %d ----- Term %d: timeout in Candiate run.", rf.me, term)
+				rf.mu.Lock()
+				if rf.currentTerm == term {
+					DPrintf("Server %d ----- Term %d: timeout reset to candidate.", rf.me, rf.currentTerm)
+					rf.state = candidate
+				}
+				rf.mu.Unlock()
 			}
 
 		case leader:
 			DPrintf("Server %d ----- Term %d: run as leader.", rf.me, term)
+			rf.mu.Unlock()
 			// Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts
 			go rf.broadcastAppendRequests()
 			time.Sleep(time.Millisecond * time.Duration(heartbeatsFreq))
@@ -668,12 +695,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.applyCh = applyCh
-	rf.heartbeatCh = make(chan bool, 1)
-	rf.grantVoteCh = make(chan bool, 1)
-	rf.electionWinCh = make(chan bool, 1)
+	rf.heartbeatCh = make(chan bool)
+	rf.grantVoteCh = make(chan bool)
+	rf.electionWinCh = make(chan bool)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.persist()
 
 	DPrintf("Server %d: initial finished with state: currentTerm: %d.", me, rf.currentTerm)
 	go rf.run()
