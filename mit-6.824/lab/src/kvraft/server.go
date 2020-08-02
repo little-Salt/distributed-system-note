@@ -1,15 +1,19 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
+
+const commitTimeout time.Duration = 2 * time.Second
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +22,27 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	getOp    = "Get"
+	putOp    = "Put"
+	appendOp = "Append"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId   int64
+	OpSeqNum  int
+	Operation string
+	Key       string
+	Val       string
+}
+
+type Result struct {
+	Seq int
+	Err Err
+	Val string
 }
 
 type KVServer struct {
@@ -35,15 +55,66 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvStore    map[string]string
+	chStore    map[int64]chan Result
+	clerkStore map[int64]Result
 }
 
+func (kv *KVServer) commitOp(op Op) (val string, err Err) {
+	_, isLeader := kv.rf.GetState()
+
+	// reduce duplicate log
+	if !isLeader {
+		DPrintf("KVServer %d: not current leader.", kv.me)
+		err = ErrWrongLeader
+	} else {
+		kv.mu.Lock()
+		lastRes, ok := kv.clerkStore[op.ClerkId]
+		kv.mu.Unlock()
+		if ok && op.OpSeqNum <= lastRes.Seq {
+			val, err = lastRes.Val, lastRes.Err
+			return
+		}
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if isLeader {
+		kv.mu.Lock()
+		DPrintf("KVServer %d: try commit op: %+v, with index: %d, term %d.", kv.me, op, index, term)
+		resultCh, ok := kv.chStore[op.ClerkId]
+		if !ok {
+			resultCh = make(chan Result)
+			kv.chStore[op.ClerkId] = resultCh
+		}
+		kv.mu.Unlock()
+
+		select {
+		case res := <-resultCh:
+			DPrintf("KVServer %d: finish op: %+v, with index: %d, term %d.", kv.me, op, index, term)
+			if res.Seq == op.OpSeqNum {
+				val, err = res.Val, res.Err
+			}
+		case <-time.After(commitTimeout):
+			DPrintf("KVServer %d: commit Timeout, request resend op", kv.me)
+			err = ErrTimout
+		}
+
+	} else {
+		DPrintf("KVServer %d: not current leader.", kv.me)
+		err = ErrWrongLeader
+	}
+
+	return
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	getOp := Op{ClerkId: args.ClerkId, OpSeqNum: args.OpSeqNum, Operation: getOp, Key: args.Key}
+	reply.Value, reply.Err = kv.commitOp(getOp)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	putAppendOp := Op{ClerkId: args.ClerkId, OpSeqNum: args.OpSeqNum, Operation: args.Op, Key: args.Key, Val: args.Value}
+	_, reply.Err = kv.commitOp(putAppendOp)
 }
 
 //
@@ -65,6 +136,66 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) run() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		kv.applyMsg(&msg)
+	}
+}
+
+func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
+	if msg.CommandValid {
+		index, term, op := msg.CommandIndex, msg.CommandTerm, msg.Command.(Op)
+		DPrintf("KVServer %d: try apply op: %+v, with index: %d, term %d.", kv.me, op, index, term)
+		kv.applyOp(op)
+	} else {
+
+	}
+}
+
+func (kv *KVServer) sendResult(clerkId int64, res Result) {
+	ch, ok := kv.chStore[clerkId]
+	if ok {
+		select {
+		case ch <- res:
+			DPrintf("KVServer %d: send result.", kv.me)
+		default:
+		}
+	}
+}
+
+func (kv *KVServer) applyOp(op Op) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	res := Result{Seq: op.OpSeqNum, Err: OK}
+	lastRes, ok := kv.clerkStore[op.ClerkId]
+	opSeq := op.OpSeqNum
+	if !ok || lastRes.Seq < opSeq {
+		switch op.Operation {
+		case getOp:
+			_, ok := kv.kvStore[op.Key]
+			if !ok {
+				res.Err = ErrNoKey
+			}
+		case putOp:
+			kv.kvStore[op.Key] = op.Val
+		case appendOp:
+			kv.kvStore[op.Key] += op.Val
+		default:
+			// nothing
+		}
+		res.Val = kv.kvStore[op.Key]
+		kv.clerkStore[op.ClerkId] = res
+		DPrintf("KVServer %d: apply op: %+v, res:%v", kv.me, op, res)
+	} else {
+		res.Err = lastRes.Err
+		res.Val = lastRes.Val
+	}
+
+	kv.sendResult(op.ClerkId, res)
 }
 
 //
@@ -96,6 +227,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvStore = make(map[string]string)
+	kv.chStore = make(map[int64]chan Result)
+	kv.clerkStore = make(map[int64]Result)
+
+	go kv.run()
 
 	return kv
 }

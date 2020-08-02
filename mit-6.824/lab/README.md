@@ -34,3 +34,8 @@ Each worker initializes with configuration send by the master. After initializat
 - [x] Part A: Implement Raft leader election and heartbeats
 - [X] Part B: Implement the leader and follower code to append new log entries
 - [X] Part C: Raft persistent state
+
+## Lab3 Fault-tolerant Key/Value Service
+
+- [x] Part A: Key/value service without log compaction
+- [ ] Part B: Key/value service with log compaction

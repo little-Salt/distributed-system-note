@@ -56,6 +56,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type LogEntry struct {
@@ -115,8 +116,8 @@ func (rf *Raft) applyLogs() {
 	defer rf.mu.Unlock()
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		DPrintf("Server %d ----- Term %d: server apply log with index: %d, command: %v", rf.me, rf.currentTerm, i, rf.logs[i].Command)
-		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i, Command: rf.logs[i].Command}
+		DPrintf("Server %d ----- Term %d: server apply log with index: %d, term: %d, command: %v", rf.me, rf.currentTerm, i, rf.logs[i].Term, rf.logs[i].Command)
+		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i, CommandTerm: rf.logs[i].Term, Command: rf.logs[i].Command}
 	}
 	rf.lastApplied = rf.commitIndex
 }

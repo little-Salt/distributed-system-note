@@ -1,13 +1,23 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"../labrpc"
+)
+
+const retryInterval = 50 * time.Millisecond
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	id     int64
+	seqNum int
+
+	clusterSize int
+	leader      int
 }
 
 func nrand() int64 {
@@ -20,8 +30,18 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+
+	ck.id = nrand()
+	ck.seqNum = 0
+
+	ck.clusterSize = len(servers)
+	ck.leader = 0
+
 	return ck
+}
+
+func (ck *Clerk) call(api string, args interface{}, reply interface{}) bool {
+	return ck.servers[ck.leader].Call(api, args, reply)
 }
 
 //
@@ -37,9 +57,22 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+	args := GetArgs{ClerkId: ck.id, OpSeqNum: ck.seqNum, Key: key}
+	reply := GetReply{}
+	for {
+		DPrintf("Clerk: %d ---- SeqNum: %d: send Get(%s) to Server %d", ck.id, ck.seqNum, key, ck.leader)
+		if ck.call("KVServer.Get", &args, &reply) && (reply.Err == OK || reply.Err == ErrNoKey) {
+			DPrintf("Clerk: %d ---- SeqNum: %d: recieve reply:%v from Server %d", ck.id, ck.seqNum, reply, ck.leader)
+			ck.seqNum++
+			return reply.Value
+		}
+		if reply.Err == ErrTimout {
+			time.Sleep(retryInterval)
+		} else {
+			ck.leader = (ck.leader + 1) % ck.clusterSize
+		}
+		reply = GetReply{}
+	}
 }
 
 //
@@ -53,7 +86,22 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{ClerkId: ck.id, OpSeqNum: ck.seqNum, Op: op, Key: key, Value: value}
+	reply := PutAppendReply{}
+	for {
+		DPrintf("Clerk: %d ---- SeqNum: %d: send %s(%s, %s) to Server %d", ck.id, ck.seqNum, op, key, value, ck.leader)
+		if ck.call("KVServer.PutAppend", &args, &reply) && reply.Err == OK {
+			DPrintf("Clerk: %d ---- SeqNum: %d: recieve reply:%v from Server %d", ck.id, ck.seqNum, reply, ck.leader)
+			ck.seqNum++
+			return
+		}
+		if reply.Err == ErrTimout {
+			time.Sleep(retryInterval)
+		} else {
+			ck.leader = (ck.leader + 1) % ck.clusterSize
+		}
+		reply = PutAppendReply{}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
