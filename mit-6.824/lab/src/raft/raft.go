@@ -374,12 +374,7 @@ func (rf *Raft) getVoteFromPeer(server int, args *RequestVoteArgs, reply *Reques
 		if rf.state == candidate && reply.VoteGranted {
 			rf.voteGrantedCount++
 			if rf.voteGrantedCount > (rf.clusterSize / 2) {
-				// rf.setToLeader()
-				// rf.electionWinCh <- true
 				rf.nonBlockChSend(rf.electionWinCh, true)
-				// rf.mu.Unlock()
-				// rf.electionWinCh <- true
-				// rf.mu.Lock()
 				DPrintf("Server %d ----- Term %d: wins election in term %d.", rf.me, rf.currentTerm, args.Term)
 				return
 			}
