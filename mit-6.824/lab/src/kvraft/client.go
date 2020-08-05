@@ -8,7 +8,8 @@ import (
 	"../labrpc"
 )
 
-const retryInterval = 50 * time.Millisecond
+const timeoutRetryInterval = 100 * time.Millisecond
+const retryInterval = 10 * time.Millisecond
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -67,9 +68,10 @@ func (ck *Clerk) Get(key string) string {
 			return reply.Value
 		}
 		if reply.Err == ErrTimout {
-			time.Sleep(retryInterval)
+			time.Sleep(timeoutRetryInterval)
 		} else {
 			ck.leader = (ck.leader + 1) % ck.clusterSize
+			time.Sleep(retryInterval)
 		}
 		reply = GetReply{}
 	}
@@ -96,9 +98,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			return
 		}
 		if reply.Err == ErrTimout {
-			time.Sleep(retryInterval)
+			time.Sleep(timeoutRetryInterval)
 		} else {
 			ck.leader = (ck.leader + 1) % ck.clusterSize
+			time.Sleep(retryInterval)
 		}
 		reply = PutAppendReply{}
 	}

@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,8 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	lastAppliedIndex int
+
 	kvStore    map[string]string
 	chStore    map[int64]chan Result
 	clerkStore map[int64]Result
@@ -67,6 +70,7 @@ func (kv *KVServer) commitOp(op Op) (val string, err Err) {
 	if !isLeader {
 		DPrintf("KVServer %d: not current leader.", kv.me)
 		err = ErrWrongLeader
+		return
 	} else {
 		kv.mu.Lock()
 		lastRes, ok := kv.clerkStore[op.ClerkId]
@@ -138,6 +142,26 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) readSnapshot() {
+	data := kv.rf.GetSnapShot()
+
+	if data == nil {
+
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvStore map[string]string
+	var clerkStore map[int64]Result
+
+	if d.Decode(&kvStore) != nil || d.Decode(&clerkStore) != nil {
+
+	} else {
+		kv.kvStore = kvStore
+		kv.clerkStore = clerkStore
+	}
+}
+
 func (kv *KVServer) run() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
@@ -146,13 +170,28 @@ func (kv *KVServer) run() {
 }
 
 func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	DPrintf("KVServer %d: try apply msg:%+v.", kv.me, *msg)
+	index, term := msg.CommandIndex, msg.CommandTerm
 	if msg.CommandValid {
-		index, term, op := msg.CommandIndex, msg.CommandTerm, msg.Command.(Op)
+		op := msg.Command.(Op)
 		DPrintf("KVServer %d: try apply op: %+v, with index: %d, term %d.", kv.me, op, index, term)
 		kv.applyOp(op)
-	} else {
 
+		if kv.maxraftstate != -1 && kv.rf.GetPersistSize() > kv.maxraftstate {
+			data := kv.takeSnapshot()
+			go kv.rf.TakeSnapshot(index, data)
+		}
+
+	} else {
+		DPrintf("KVServer %d: try read snapshot: index: %d, term %d.", kv.me, index, term)
+		kv.readSnapshot()
 	}
+	if index > kv.lastAppliedIndex {
+		kv.lastAppliedIndex = index
+	}
+
 }
 
 func (kv *KVServer) sendResult(clerkId int64, res Result) {
@@ -167,9 +206,6 @@ func (kv *KVServer) sendResult(clerkId int64, res Result) {
 }
 
 func (kv *KVServer) applyOp(op Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	res := Result{Seq: op.OpSeqNum, Err: OK}
 	lastRes, ok := kv.clerkStore[op.ClerkId]
 	opSeq := op.OpSeqNum
@@ -196,6 +232,15 @@ func (kv *KVServer) applyOp(op Op) {
 	}
 
 	kv.sendResult(op.ClerkId, res)
+}
+
+func (kv *KVServer) takeSnapshot() []byte {
+	// serialize-deserialize
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	e.Encode(kv.clerkStore)
+	return w.Bytes()
 }
 
 //

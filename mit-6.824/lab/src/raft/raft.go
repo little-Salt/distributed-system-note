@@ -81,6 +81,7 @@ type Raft struct {
 	voteGrantedCount int
 	logsCount        int
 	clusterSize      int
+	logOffset        int
 
 	// Persistent state on all servers
 	currentTerm int
@@ -102,6 +103,14 @@ type Raft struct {
 	electionWinCh chan bool
 }
 
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	return rf.logs[index-rf.logOffset]
+}
+
+func (rf *Raft) getRangeLogEntries(index int) []LogEntry {
+	return rf.logs[(index - rf.logOffset):]
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -116,10 +125,24 @@ func (rf *Raft) applyLogs() {
 	defer rf.mu.Unlock()
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		DPrintf("Server %d ----- Term %d: server apply log with index: %d, term: %d, command: %v", rf.me, rf.currentTerm, i, rf.logs[i].Term, rf.logs[i].Command)
-		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i, CommandTerm: rf.logs[i].Term, Command: rf.logs[i].Command}
+		log := rf.getLogEntry(i)
+		DPrintf("Server %d ----- Term %d: server apply log with index: %d, term: %d, command: %v", rf.me, rf.currentTerm, i, log.Term, log.Command)
+		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i, CommandTerm: log.Term, Command: log.Command}
 	}
 	rf.lastApplied = rf.commitIndex
+}
+
+func (rf *Raft) GetPersistSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) serializePersist() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	return w.Bytes()
 }
 
 //
@@ -128,13 +151,7 @@ func (rf *Raft) applyLogs() {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.serializePersist())
 	DPrintf("Server %d ----- Term %d: server save presist state", rf.me, rf.currentTerm)
 }
 
@@ -228,7 +245,7 @@ func (rf *Raft) nonBlockChSend(ch chan bool, val bool) {
 
 func (rf *Raft) getLastLogInfo() (int, int) {
 	lastLogIndex := rf.logsCount - 1
-	lastLogTerm := rf.logs[lastLogIndex].Term
+	lastLogTerm := rf.getLogEntry(lastLogIndex).Term
 	return lastLogIndex, lastLogTerm
 }
 
@@ -277,13 +294,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.nonBlockChSend(rf.heartbeatCh, true)
 
 	// consistency check
-	if args.PrevLogIndex >= 0 && args.PrevLogIndex < rf.logsCount && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.logOffset && args.PrevLogIndex < rf.logsCount && rf.logs[args.PrevLogIndex-rf.logOffset].Term == args.PrevLogTerm {
 		DPrintf("Server %d ----- Term %d: pass consistency check.", rf.me, rf.currentTerm)
 		if len(args.Entries) != 0 {
 			DPrintf("Server %d ----- Term %d: append Entries.", rf.me, rf.currentTerm)
-			rf.logs = rf.logs[:(args.PrevLogIndex + 1)]
+			rf.logs = rf.logs[:(args.PrevLogIndex + 1 - rf.logOffset)]
 			rf.logs = append(rf.logs, args.Entries...)
-			rf.logsCount = len(rf.logs)
+			rf.logsCount = len(rf.logs) + rf.logOffset
 			rf.persist()
 		}
 
@@ -304,15 +321,146 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) findNextRetryIndex(prevTryIndex int, prevTryTerm int) int {
 	if prevTryIndex >= rf.logsCount {
 		return rf.logsCount
-	} else if prevTryIndex <= 0 {
-		return 1
+	} else if prevTryIndex <= rf.logOffset {
+		return rf.logOffset + 1
 	} else {
-		term := rf.logs[prevTryIndex].Term
+		term := rf.getLogEntry(prevTryIndex).Term
 		nextryIndex := prevTryIndex - 1
-		for ; nextryIndex > 0 && rf.logs[nextryIndex].Term == term; nextryIndex-- {
+		for ; nextryIndex > rf.logOffset && rf.getLogEntry(nextryIndex).Term == term; nextryIndex-- {
 		}
 
 		return (nextryIndex + 1)
+	}
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("Server %d ----- Term %d: recieved install snapshot request with arg: %+v", rf.me, rf.currentTerm, *args)
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		DPrintf("Server %d ----- Term %d: request from previouse term, do nothing. reply %+v", rf.me, rf.currentTerm, *reply)
+		return
+	}
+
+	rf.nonBlockChSend(rf.heartbeatCh, true)
+
+	if args.Term > rf.currentTerm {
+		rf.setToFollower(args.Term)
+		reply.Term = rf.currentTerm
+	}
+
+	if args.LastIncludedIndex > rf.commitIndex {
+		// update snapshot and ask server to read
+		rf.updateSnapshot(args)
+		rf.applySnapshot()
+	} else {
+		// nonthing ?
+	}
+
+}
+
+type Snapshot struct {
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+func (rf *Raft) applySnapshot() {
+	DPrintf("Server %d ----- Term %d: server apply snapshot with index: %d, term: %d.", rf.me, rf.currentTerm, rf.logOffset, rf.getLogEntry(rf.logOffset).Term)
+	rf.applyCh <- ApplyMsg{CommandValid: false, CommandIndex: rf.logOffset, CommandTerm: rf.getLogEntry(rf.logOffset).Term}
+	rf.lastApplied = rf.commitIndex
+}
+
+func (rf *Raft) GetSnapShot() []byte {
+	s := rf.deserializeSnapshot(rf.persister.ReadSnapshot())
+	return s.Data
+}
+
+func (rf *Raft) serializeSnapshot(s Snapshot) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(s.LastIncludedIndex)
+	e.Encode(s.LastIncludedTerm)
+	e.Encode(s.Data)
+	return w.Bytes()
+}
+
+func (rf *Raft) deserializeSnapshot(data []byte) Snapshot {
+	s := Snapshot{}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&s.LastIncludedIndex)
+	d.Decode(&s.LastIncludedTerm)
+	d.Decode(&s.Data)
+	return s
+}
+
+func (rf *Raft) TakeSnapshot(index int, data []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if index < rf.logOffset || index >= rf.logsCount {
+		return
+	}
+	DPrintf("Server %d ----- Term %d: take snapshot ", rf.me, rf.currentTerm)
+	lastIncludedIndex := index
+	lastIncludedTerm := rf.getLogEntry(lastIncludedIndex).Term
+	newSanpshot := Snapshot{lastIncludedIndex, lastIncludedTerm, data}
+
+	// change state
+	newLogs := make([]LogEntry, 0)
+	newLogs = append(newLogs, rf.getRangeLogEntries(index)...)
+	rf.logOffset = lastIncludedIndex
+	rf.logs = newLogs
+
+	rf.persister.SaveStateAndSnapshot(rf.serializePersist(), rf.serializeSnapshot(newSanpshot))
+}
+
+func (rf *Raft) updateSnapshot(args *InstallSnapshotArgs) {
+	DPrintf("Server %d ----- Term %d: update snapshot ", rf.me, rf.currentTerm)
+	// change state
+	rf.logOffset = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	newLogs := make([]LogEntry, 0)
+	newLogs = append(newLogs, LogEntry{Term: args.LastIncludedTerm})
+	rf.logs = newLogs
+	rf.logsCount = len(rf.logs) + rf.logOffset
+
+	rf.persister.SaveStateAndSnapshot(rf.serializePersist(), args.Data)
+}
+
+func (rf *Raft) readSnapshot(data []byte) {
+	if data == nil {
+		DPrintf("Server %d ----- Term %d: no previous snapshot ", rf.me, rf.currentTerm)
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	snapshot := Snapshot{}
+
+	if d.Decode(&snapshot.LastIncludedIndex) != nil || d.Decode(&snapshot.LastIncludedTerm) != nil || d.Decode(&snapshot.Data) != nil {
+		DPrintf("Server %d ----- Term %d: server restore from snapshot fail", rf.me, rf.currentTerm)
+	} else {
+		DPrintf("Server %d ----- Term %d: server restore from snapshot ", rf.me, rf.currentTerm)
+		rf.logOffset = snapshot.LastIncludedIndex
+		rf.commitIndex = rf.logOffset
+		rf.applySnapshot()
 	}
 }
 
@@ -424,7 +572,7 @@ func (rf *Raft) ackAppendEntrie(server int, args *AppendEntriesArgs, reply *Appe
 				DPrintf("Server %d ----- Term %d: append to server %d success, update nextIndex: %d, matchIndex: %d.", rf.me, rf.currentTerm, server, rf.nextIndex[server], rf.matchIndex[server])
 
 				possibleCommited := rf.matchIndex[server]
-				if possibleCommited > rf.commitIndex && rf.logs[possibleCommited].Term == rf.currentTerm {
+				if possibleCommited > rf.commitIndex && rf.getLogEntry(possibleCommited).Term == rf.currentTerm {
 					count := 0
 					DPrintf("Server %d ----- Term %d: Checkeing possible Commited Index: %d.", rf.me, rf.currentTerm, possibleCommited)
 					for _, index := range rf.matchIndex {
@@ -448,6 +596,45 @@ func (rf *Raft) ackAppendEntrie(server int, args *AppendEntriesArgs, reply *Appe
 			DPrintf("Server %d ----- Term %d: not leader in term %d", rf.me, rf.currentTerm, reply.Term)
 		}
 	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	DPrintf("Server %d ----- Term %d: send InstallSnapshot request to server %d with args %+v.", rf.me, args.Term, server, *args)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	return ok
+}
+
+func (rf *Raft) ackInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	ok := rf.sendInstallSnapshot(server, args, reply)
+
+	if !ok {
+		DPrintf("Server %d ----- Term %d: no InstallSnapshot reply from server %d for term %d.", rf.me, rf.currentTerm, server, args.Term)
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("Server %d ----- Term %d: recieved InstallSnapshot reply from server %d with reply %+v", rf.me, rf.currentTerm, server, *reply)
+
+	if reply.Term < rf.currentTerm {
+		// invalid reply: reply to old or have enough vote
+		DPrintf("Server %d ----- Term %d: reply invalid", rf.me, rf.currentTerm)
+	} else if reply.Term > rf.currentTerm {
+		// discover higher term
+		rf.setToFollower(reply.Term)
+	} else {
+		if rf.state == leader {
+			if args.LastIncludedIndex > rf.matchIndex[server] {
+				rf.matchIndex[server] = args.LastIncludedIndex
+				rf.nextIndex[server] = args.LastIncludedIndex + 1
+			}
+		} else {
+			DPrintf("Server %d ----- Term %d: not leader in term %d", rf.me, rf.currentTerm, reply.Term)
+		}
+	}
+
 }
 
 //
@@ -535,20 +722,37 @@ func (rf *Raft) broadcastAppendRequests() {
 	DPrintf("Server %d ----- Term %d: broadcast Append request.", rf.me, rf.currentTerm)
 	for server, _ := range rf.peers {
 		if server != rf.me {
-			// build AppendEntriesArgs for each peers
-			args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me, LeaderCommit: rf.commitIndex}
+
 			nextIndex := rf.nextIndex[server]
-			if nextIndex >= 0 && nextIndex <= rf.logsCount {
-				args.Entries = rf.logs[rf.nextIndex[server]:]
-			}
+			if nextIndex < rf.logOffset {
 
-			args.PrevLogIndex = nextIndex - 1
-			if args.PrevLogIndex >= 0 {
-				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-			}
+				// install snap shot
+				args := InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.logOffset,
+					LastIncludedTerm:  rf.getLogEntry(rf.logOffset).Term,
+					Data:              rf.persister.ReadSnapshot()}
+				reply := InstallSnapshotReply{}
 
-			reply := AppendEntriesReply{}
-			go rf.ackAppendEntrie(server, &args, &reply)
+				go rf.ackInstallSnapshot(server, &args, &reply)
+
+			} else {
+				// build AppendEntriesArgs for each peers
+				args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me, LeaderCommit: rf.commitIndex}
+
+				if nextIndex >= rf.logOffset && nextIndex <= rf.logsCount {
+					args.Entries = rf.getRangeLogEntries(nextIndex)
+				}
+
+				args.PrevLogIndex = nextIndex - 1
+				if args.PrevLogIndex >= rf.logOffset {
+					args.PrevLogTerm = rf.getLogEntry(args.PrevLogIndex).Term
+				}
+
+				reply := AppendEntriesReply{}
+				go rf.ackAppendEntrie(server, &args, &reply)
+			}
 		}
 	}
 
@@ -685,6 +889,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.logs = append(rf.logs, LogEntry{Term: 0})
 
+	rf.logOffset = 0
 	rf.logsCount = len(rf.logs)
 
 	rf.commitIndex = 0
@@ -697,7 +902,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.persist()
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	DPrintf("Server %d: initial finished with state: currentTerm: %d.", me, rf.currentTerm)
 	go rf.run()
